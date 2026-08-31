@@ -3,15 +3,17 @@
  *
  * Backend that does the things the Flutter app itself cannot
  * safely do on its own:
- *   1. POST /clear-student-data  — delete non-admin Auth accounts
- *   2. POST /change-admin-email  — instantly change the calling
+ *   1. POST /clear-student-data       — delete non-admin Auth accounts
+ *   2. POST /change-admin-email       — instantly change the calling
  *      admin's own email (no "click the verification link" step)
+ *   3. POST /reset-student-password   — admin-approved student
+ *      password reset (real Auth password change via Admin SDK)
  *
  * Deployed for free on Render.com — no credit card needed, and
  * this server itself never touches your Firebase billing plan
  * (Spark/free plan is fine).
  *
- * SECURITY (both endpoints):
+ * SECURITY (all endpoints):
  *   - Require a valid Firebase ID token in the Authorization
  *     header (Authorization: Bearer <token>).
  *   - Look up that user's Firestore users/{uid} doc and only
@@ -55,8 +57,9 @@ app.get('/', (req, res) => {
 
 // ----------------------------------------------------------------
 // Shared helper: verify the caller is a signed-in admin.
-// Returns { callerUid } on success, or sends an error response and
-// returns null (caller should just `return` when this is null).
+// Returns { callerUid, callerData } on success, or sends an error
+// response and returns null (caller should just `return` when
+// this is null).
 // ----------------------------------------------------------------
 async function requireAdmin(req, res) {
   const authHeader = req.headers.authorization || '';
@@ -223,6 +226,62 @@ app.post('/change-admin-email', async (req, res) => {
 
     if (err.code === 'auth/invalid-email') {
       return res.status(400).json({ error: 'That email address is invalid.' });
+    }
+
+    return res.status(500).json({ error: err.message || 'Unknown error.' });
+  }
+});
+
+// ----------------------------------------------------------------
+// POST /reset-student-password
+// Header required: Authorization: Bearer <Firebase ID token>
+// Body: { "registerNumber": "...", "newPassword": "..." }
+//
+// Admin verifies the student's uploaded ID card manually in the
+// "Pending Requests" screen, then approves with a new password —
+// this endpoint performs the actual Firebase Auth password change
+// via the Admin SDK. The client (admin_dashboard.dart) then marks
+// the request document as 'approved'.
+// ----------------------------------------------------------------
+app.post('/reset-student-password', async (req, res) => {
+  try {
+    const adminInfo = await requireAdmin(req, res);
+    if (!adminInfo) return;
+
+    const registerNumber = (req.body?.registerNumber || '')
+      .trim()
+      .toLowerCase();
+    const newPassword = req.body?.newPassword || '';
+
+    if (!registerNumber) {
+      return res.status(400).json({ error: 'registerNumber is required.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res
+        .status(400)
+        .json({ error: 'newPassword must be at least 6 characters.' });
+    }
+
+    const studentEmail = `${registerNumber}@student.smartletter.local`;
+
+    let studentUser;
+    try {
+      studentUser = await auth.getUserByEmail(studentEmail);
+    } catch (err) {
+      return res.status(404).json({
+        error: 'No student account found for that register number.',
+      });
+    }
+
+    await auth.updateUser(studentUser.uid, { password: newPassword });
+
+    return res.json({ success: true, uid: studentUser.uid });
+  } catch (err) {
+    console.error('reset-student-password failed:', err);
+
+    if (err.code === 'auth/invalid-password') {
+      return res.status(400).json({ error: 'That password is invalid.' });
     }
 
     return res.status(500).json({ error: err.message || 'Unknown error.' });
