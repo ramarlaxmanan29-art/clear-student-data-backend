@@ -8,16 +8,25 @@
  *      admin's own email (no "click the verification link" step)
  *   3. POST /reset-student-password   — admin-approved student
  *      password reset (real Auth password change via Admin SDK)
+ *   4. POST /student-reset-password   — student self-service reset
+ *      using Register Number only (no admin login needed)
+ *   5. POST /admin-reset-password     — admin self-service reset
+ *      using Admin Name only (no admin login needed)
  *
  * Deployed for free on Render.com — no credit card needed, and
  * this server itself never touches your Firebase billing plan
  * (Spark/free plan is fine).
  *
- * SECURITY (all endpoints):
- *   - Require a valid Firebase ID token in the Authorization
- *     header (Authorization: Bearer <token>).
- *   - Look up that user's Firestore users/{uid} doc and only
- *     proceed if role == 'admin'. Anyone else gets 403 Forbidden.
+ * SECURITY:
+ *   - Endpoints 1-3 require a valid Firebase ID token in the
+ *     Authorization header (Authorization: Bearer <token>) and
+ *     the caller's Firestore users/{uid} doc must have
+ *     role == 'admin'.
+ *   - Endpoints 4-5 are intentionally PUBLIC (no login token) —
+ *     they exist specifically for "I forgot my password" recovery
+ *     before the person can log in. They only need the Register
+ *     Number / Admin Name to identify the account. There is no ID
+ *     verification step, by explicit request.
  *   - Firebase service account credentials are read from an
  *     ENVIRONMENT VARIABLE (FIREBASE_SERVICE_ACCOUNT_JSON), never
  *     from a file committed to the repo.
@@ -201,15 +210,8 @@ app.post('/change-admin-email', async (req, res) => {
         .json({ error: 'New email must be different from the old email.' });
     }
 
-    // ------------------------------------------------------
-    // Update Firebase Auth email immediately (Admin SDK bypasses
-    // the "verify before update" requirement the client SDK has).
-    // ------------------------------------------------------
     await auth.updateUser(callerUid, { email: newEmail });
 
-    // ------------------------------------------------------
-    // Keep Firestore users/{uid}.email in sync.
-    // ------------------------------------------------------
     await db.collection('users').doc(callerUid).update({
       email: newEmail,
     });
@@ -279,6 +281,128 @@ app.post('/reset-student-password', async (req, res) => {
     return res.json({ success: true, uid: studentUser.uid });
   } catch (err) {
     console.error('reset-student-password failed:', err);
+
+    if (err.code === 'auth/invalid-password') {
+      return res.status(400).json({ error: 'That password is invalid.' });
+    }
+
+    return res.status(500).json({ error: err.message || 'Unknown error.' });
+  }
+});
+
+// ----------------------------------------------------------------
+// POST /student-reset-password   (PUBLIC — no login token needed)
+// Body: { "registerNumber": "...", "newPassword": "..." }
+//
+// Immediate, automatic self-service password reset for a student
+// who forgot their password — identified by Register Number only.
+// No ID card / admin approval step, by explicit request.
+// ----------------------------------------------------------------
+app.post('/student-reset-password', async (req, res) => {
+  try {
+    const registerNumber = (req.body?.registerNumber || '')
+      .trim()
+      .toLowerCase();
+    const newPassword = req.body?.newPassword || '';
+
+    if (!registerNumber) {
+      return res.status(400).json({ error: 'registerNumber is required.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res
+        .status(400)
+        .json({ error: 'newPassword must be at least 6 characters.' });
+    }
+
+    const studentEmail = `${registerNumber}@student.smartletter.local`;
+
+    let studentUser;
+    try {
+      studentUser = await auth.getUserByEmail(studentEmail);
+    } catch (err) {
+      return res.status(404).json({
+        error: 'No student account found for that register number.',
+      });
+    }
+
+    const studentDoc = await db.collection('users').doc(studentUser.uid).get();
+
+    if (!studentDoc.exists || studentDoc.data().role !== 'student') {
+      return res.status(404).json({
+        error: 'No student account found for that register number.',
+      });
+    }
+
+    await auth.updateUser(studentUser.uid, { password: newPassword });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('student-reset-password failed:', err);
+
+    if (err.code === 'auth/invalid-password') {
+      return res.status(400).json({ error: 'That password is invalid.' });
+    }
+
+    return res.status(500).json({ error: err.message || 'Unknown error.' });
+  }
+});
+
+// ----------------------------------------------------------------
+// POST /admin-reset-password   (PUBLIC — no login token needed)
+// Body: { "adminName": "...", "newPassword": "..." }
+//
+// Immediate, automatic self-service password reset for an admin
+// who forgot their password — identified by Admin Name only.
+// No verification step, by explicit request.
+// ----------------------------------------------------------------
+app.post('/admin-reset-password', async (req, res) => {
+  try {
+    const adminName = (req.body?.adminName || '').trim().toLowerCase();
+    const newPassword = req.body?.newPassword || '';
+
+    if (!adminName) {
+      return res.status(400).json({ error: 'adminName is required.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res
+        .status(400)
+        .json({ error: 'newPassword must be at least 6 characters.' });
+    }
+
+    const usersSnapshot = await db
+      .collection('users')
+      .where('role', '==', 'admin')
+      .get();
+
+    const matches = [];
+    usersSnapshot.forEach((doc) => {
+      const data = doc.data();
+      const storedName = (data.name || '').trim().toLowerCase();
+      if (storedName === adminName) {
+        matches.push({ uid: doc.id, ...data });
+      }
+    });
+
+    if (matches.length === 0) {
+      return res
+        .status(404)
+        .json({ error: 'No admin account found with that name.' });
+    }
+
+    if (matches.length > 1) {
+      return res.status(409).json({
+        error:
+          'More than one admin account has this name. Please contact support.',
+      });
+    }
+
+    await auth.updateUser(matches[0].uid, { password: newPassword });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('admin-reset-password failed:', err);
 
     if (err.code === 'auth/invalid-password') {
       return res.status(400).json({ error: 'That password is invalid.' });
