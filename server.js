@@ -1,30 +1,22 @@
 /**
  * server.js
  *
- * Small backend server that does the ONE thing the Flutter app
- * itself cannot safely do: delete other users' Firebase Auth
- * accounts. It exposes a single HTTP endpoint that the admin panel
- * calls when "Clear All Data" is pressed.
+ * Backend that does the things the Flutter app itself cannot
+ * safely do on its own:
+ *   1. POST /clear-student-data  — delete non-admin Auth accounts
+ *   2. POST /change-admin-email  — instantly change the calling
+ *      admin's own email (no "click the verification link" step)
  *
  * Deployed for free on Render.com — no credit card needed, and
  * this server itself never touches your Firebase billing plan
  * (Spark/free plan is fine).
  *
- * WHAT IT DELETES:
- *   Every document in Firestore 'users' EXCEPT the calling admin's
- *   own document — this includes students AND staff (advisor, hod,
- *   principal, security) — matching the app's "Clear All Data"
- *   behaviour exactly. For each of them:
- *     1. Delete their Firebase Auth account
- *     2. Delete their 'users' document
- *   Then delete every document in 'loginIndex' (all of it).
- *
- * SECURITY:
- *   - The endpoint requires a valid Firebase ID token in the
- *     Authorization header (Authorization: Bearer <token>).
- *   - It looks up that user's Firestore users/{uid} doc and only
- *     proceeds if role == 'admin'. Anyone else gets 403 Forbidden.
- *   - The Firebase service account credentials are read from an
+ * SECURITY (both endpoints):
+ *   - Require a valid Firebase ID token in the Authorization
+ *     header (Authorization: Bearer <token>).
+ *   - Look up that user's Firestore users/{uid} doc and only
+ *     proceed if role == 'admin'. Anyone else gets 403 Forbidden.
+ *   - Firebase service account credentials are read from an
  *     ENVIRONMENT VARIABLE (FIREBASE_SERVICE_ACCOUNT_JSON), never
  *     from a file committed to the repo.
  */
@@ -62,6 +54,43 @@ app.get('/', (req, res) => {
 });
 
 // ----------------------------------------------------------------
+// Shared helper: verify the caller is a signed-in admin.
+// Returns { callerUid } on success, or sends an error response and
+// returns null (caller should just `return` when this is null).
+// ----------------------------------------------------------------
+async function requireAdmin(req, res) {
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ')
+    ? authHeader.slice('Bearer '.length)
+    : null;
+
+  if (!idToken) {
+    res.status(401).json({ error: 'Missing Authorization header.' });
+    return null;
+  }
+
+  let decodedToken;
+  try {
+    decodedToken = await auth.verifyIdToken(idToken);
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid or expired token.' });
+    return null;
+  }
+
+  const callerUid = decodedToken.uid;
+  const callerDoc = await db.collection('users').doc(callerUid).get();
+
+  if (!callerDoc.exists || callerDoc.data().role !== 'admin') {
+    res
+      .status(403)
+      .json({ error: 'Only admin accounts can perform this action.' });
+    return null;
+  }
+
+  return { callerUid, callerData: callerDoc.data() };
+}
+
+// ----------------------------------------------------------------
 // POST /clear-student-data
 // Header required: Authorization: Bearer <Firebase ID token>
 // Deletes EVERY non-admin user (students + staff) — Auth account
@@ -69,40 +98,12 @@ app.get('/', (req, res) => {
 // ----------------------------------------------------------------
 app.post('/clear-student-data', async (req, res) => {
   try {
-    // ------------------------------------------------------
-    // STEP 0: Verify the caller is a signed-in admin
-    // ------------------------------------------------------
-    const authHeader = req.headers.authorization || '';
-    const idToken = authHeader.startsWith('Bearer ')
-      ? authHeader.slice('Bearer '.length)
-      : null;
-
-    if (!idToken) {
-      return res.status(401).json({ error: 'Missing Authorization header.' });
-    }
-
-    let decodedToken;
-    try {
-      decodedToken = await auth.verifyIdToken(idToken);
-    } catch (err) {
-      return res.status(401).json({ error: 'Invalid or expired token.' });
-    }
-
-    const callerUid = decodedToken.uid;
-    const callerDoc = await db.collection('users').doc(callerUid).get();
-
-    if (!callerDoc.exists || callerDoc.data().role !== 'admin') {
-      return res
-        .status(403)
-        .json({ error: 'Only admin accounts can perform this action.' });
-    }
+    const adminInfo = await requireAdmin(req, res);
+    if (!adminInfo) return;
+    const { callerUid } = adminInfo;
 
     // ------------------------------------------------------
     // STEP 1: Find every 'users' doc EXCEPT the calling admin
-    // (students, advisors, hods, principals, security, and
-    // even other admin accounts — matches the app's own
-    // _deleteCollection('users', adminUid) behaviour, which
-    // only ever protects the CURRENTLY LOGGED IN admin).
     // ------------------------------------------------------
     const usersSnapshot = await db.collection('users').get();
 
@@ -137,9 +138,7 @@ app.post('/clear-student-data', async (req, res) => {
     const deletedUserDocs = await deleteDocsInBatches(userDocRefs);
 
     // ------------------------------------------------------
-    // STEP 4: Delete ALL of 'loginIndex' (students only ever
-    // appear here per the app's schema, so clearing all of it
-    // is correct and matches the app's own behaviour).
+    // STEP 4: Delete ALL of 'loginIndex'
     // ------------------------------------------------------
     const loginIndexSnapshot = await db.collection('loginIndex').get();
     const loginIndexDocRefs = [];
@@ -157,6 +156,75 @@ app.post('/clear-student-data', async (req, res) => {
     });
   } catch (err) {
     console.error('clear-student-data failed:', err);
+    return res.status(500).json({ error: err.message || 'Unknown error.' });
+  }
+});
+
+// ----------------------------------------------------------------
+// POST /change-admin-email
+// Header required: Authorization: Bearer <Firebase ID token>
+// Body: { "oldEmail": "...", "newEmail": "..." }
+//
+// Instantly changes the CALLING admin's own email — no
+// verification link needs to be clicked, because this uses the
+// Admin SDK (server-side, trusted), not the client SDK.
+// ----------------------------------------------------------------
+app.post('/change-admin-email', async (req, res) => {
+  try {
+    const adminInfo = await requireAdmin(req, res);
+    if (!adminInfo) return;
+    const { callerUid, callerData } = adminInfo;
+
+    const oldEmail = (req.body?.oldEmail || '').trim().toLowerCase();
+    const newEmail = (req.body?.newEmail || '').trim().toLowerCase();
+
+    if (!oldEmail || !newEmail) {
+      return res
+        .status(400)
+        .json({ error: 'Both oldEmail and newEmail are required.' });
+    }
+
+    const currentEmailOnRecord = (callerData.email || '').trim().toLowerCase();
+
+    if (oldEmail !== currentEmailOnRecord) {
+      return res.status(400).json({
+        error: 'Old email does not match your current account email.',
+      });
+    }
+
+    if (newEmail === oldEmail) {
+      return res
+        .status(400)
+        .json({ error: 'New email must be different from the old email.' });
+    }
+
+    // ------------------------------------------------------
+    // Update Firebase Auth email immediately (Admin SDK bypasses
+    // the "verify before update" requirement the client SDK has).
+    // ------------------------------------------------------
+    await auth.updateUser(callerUid, { email: newEmail });
+
+    // ------------------------------------------------------
+    // Keep Firestore users/{uid}.email in sync.
+    // ------------------------------------------------------
+    await db.collection('users').doc(callerUid).update({
+      email: newEmail,
+    });
+
+    return res.json({ success: true, newEmail });
+  } catch (err) {
+    console.error('change-admin-email failed:', err);
+
+    if (err.code === 'auth/email-already-exists') {
+      return res
+        .status(400)
+        .json({ error: 'That email is already in use by another account.' });
+    }
+
+    if (err.code === 'auth/invalid-email') {
+      return res.status(400).json({ error: 'That email address is invalid.' });
+    }
+
     return res.status(500).json({ error: err.message || 'Unknown error.' });
   }
 });
