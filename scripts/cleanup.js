@@ -1,1 +1,8 @@
 
+{
+  "name": "firestore-cleanup",
+  "version": "1.0.0",
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  }
+}
